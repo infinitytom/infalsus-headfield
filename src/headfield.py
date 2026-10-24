@@ -27,7 +27,7 @@ from headmodel import HeadModel, OneEuro  # noqa: E402
 from routines import FollowTest, HeadCalibRoutine, ValidRoutine  # noqa: E402
 from tracker import Camera, FaceTracker, camera_names, resolve_camera  # noqa: E402
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CFG_PATH = os.path.join(ROOT, "config.json")
@@ -53,6 +53,7 @@ DEFAULTS = {
     "rel_scale_x100": 100,         # rel mode: mouse counts per screen pixel
     "output_mode": "abs",          # abs = SendInput absolute move (same mechanism as pydirectinput.moveTo)
     "output_y": 0.5,               # pin cursor height (fraction of screen); null = keep current height
+    "always_on_top": True,         # keep the HeadField window above the game (key w toggles)
     "hotkeys": {                   # global hotkeys; change here if another program already uses one
         "toggle_output": "ctrl+alt+m", "out_mode": "ctrl+alt+n", "pause": "ctrl+alt+p",
         "recenter": "ctrl+alt+c", "quit": "ctrl+alt+q"},
@@ -117,6 +118,7 @@ class App:
         self.cfg = cfg
         self.headless = headless
         winio.set_dpi_aware()
+        self.ime_off = winio.disable_ime()   # before any window: Chinese IME must not eat o/c/r...
         self.single = winio.single_instance()
         self.boost = winio.boost_process()
         self.sw, self.sh = winio.screen_size()
@@ -500,7 +502,7 @@ class App:
         cv2.putText(cv, "last 4 s (up = right side of screen)", (px0, py0 - 6), cv2.FONT_HERSHEY_SIMPLEX, 0.42,
                     (160, 160, 160), 1, cv2.LINE_AA)
         help_ = ("keys: c calibrate  v validate  t test  r re-centre  o mouse  m out-mode  "
-                 "e camera settings  s save  q quit")
+                 "e camera  w on-top  s save  q quit")
         cv2.putText(cv, help_, (10, 625), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (200, 200, 200), 1, cv2.LINE_AA)
         cv2.putText(cv, "global: " + getattr(self, "hotkey_text", ""),
                     (10, 648), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 200, 255), 1, cv2.LINE_AA)
@@ -523,6 +525,16 @@ class App:
         cv2.resizeWindow(WIN_CTRL, 520, 420)
         for key, mx, label in SLIDERS:
             cv2.createTrackbar(label, WIN_CTRL, int(self.cfg[key]), mx, lambda v: None)
+        for w in (WIN_MAIN, WIN_CTRL):
+            winio.no_ime_window(w)
+        self._top_t = 0.0
+
+    def keep_on_top(self, force=False):
+        """Re-assert 'always on top' every 2 s (a game going fullscreen can push it down)."""
+        now = time.perf_counter()
+        if force or now - self._top_t > 2.0:
+            self._top_t = now
+            winio.set_topmost(WIN_MAIN, bool(self.cfg.get("always_on_top")))
 
     def read_controls(self):
         for key, _, label in SLIDERS:
@@ -558,6 +570,10 @@ class App:
             self.cam.open_settings()
         elif k == ord("r"):
             self.hk_recenter()
+        elif k == ord("w"):
+            self.cfg["always_on_top"] = not self.cfg.get("always_on_top")
+            self.keep_on_top(force=True)
+            self.flash(f"always on top {'ON' if self.cfg['always_on_top'] else 'OFF'}")
         elif k == ord("s"):
             save_cfg(self.cfg)
             self.flash("settings saved")
@@ -579,16 +595,23 @@ class App:
         hk.start()
         hk.ready.wait(2)
         self.hotkey_text = " | ".join(f"{hk_cfg[a]} {a}" for a in actions)
-        if hk.failed:
-            taken = ", ".join(names.get(k, str(k)) for k in hk.failed)
-            self.flash(f"WARNING: hotkey(s) already used by another program: {taken} "
+        lost = [k for k in hk.failed if k not in hk.hooked]
+        if hk.hooked:
+            via = ", ".join(names.get(k, str(k)) for k in hk.hooked)
+            self.flash(f"note: {via} also used by another program -> handled via keyboard hook "
+                       f"(the other program may react too; change 'hotkeys' in config.json if so)", 10)
+        if lost:
+            taken = ", ".join(names.get(k, str(k)) for k in lost)
+            self.flash(f"WARNING: hotkey(s) not available: {taken} "
                        f"(change 'hotkeys' in config.json; is an old HeadField still running?)", 12)
         self.make_controls()
+        self.keep_on_top(force=True)
         worker = threading.Thread(target=self._track_loop, daemon=True)
         worker.start()
         threading.Thread(target=self._stats_loop, daemon=True).start()
         self.log_event(f"start: HeadField {__version__} camera={self.cfg['camera_name']} profile={self.cfg['profile']} "
                        f"signal={self.cfg['head_signal']} boost={self.boost} hotkeys_failed={hk.failed} "
+                       f"hotkeys_hooked={hk.hooked} ime_off={self.ime_off} "
                        f"other_instance={not self.single}")
         try:
             # UI thread: draw at most ~30 Hz; tracking/mouse output never wait for drawing
@@ -601,6 +624,7 @@ class App:
                 if self.last_img is not None and self.state:
                     self.draw_main(self.last_img)
                     self.draw_target()
+                self.keep_on_top()
                 self.ui_ms.append((time.perf_counter() - t0) * 1000)
                 self.handle_key(cv2.waitKey(max(1, int(33 - (time.perf_counter() - t0) * 1000))))
                 if cv2.getWindowProperty(WIN_MAIN, cv2.WND_PROP_VISIBLE) < 1:

@@ -127,6 +127,11 @@ if IS_WIN:
     class POINT(ctypes.Structure):
         _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
 
+    class KBDLLHOOKSTRUCT(ctypes.Structure):
+        _fields_ = [("vkCode", wintypes.DWORD), ("scanCode", wintypes.DWORD),
+                    ("flags", wintypes.DWORD), ("time", wintypes.DWORD),
+                    ("dwExtraInfo", ULONG_PTR)]
+
 MOUSEEVENTF_MOVE = 0x0001
 MOUSEEVENTF_ABSOLUTE = 0x8000
 
@@ -193,42 +198,162 @@ MOD_ALT, MOD_CONTROL, MOD_SHIFT, MOD_NOREPEAT = 0x1, 0x2, 0x4, 0x4000
 WM_HOTKEY, WM_QUIT = 0x0312, 0x0012
 
 
+def _call_safe(cb):
+    try:
+        cb()
+    except Exception as e:  # never kill the hotkey/hook thread
+        print("hotkey callback error:", e)
+
+
 class GlobalHotkeys(threading.Thread):
-    """RegisterHotKey-based global hotkeys; work while the game has focus.
+    """Global hotkeys that work while the game has focus.
+    First tries RegisterHotKey. If another program already owns a combination
+    (RegisterHotKey fails), that combination falls back to a low-level keyboard
+    hook, which sees the keys anyway and does not depend on the input method.
     bindings: list of (mods, vk, callback)."""
 
     def __init__(self, bindings):
         super().__init__(daemon=True)
         self.bindings = bindings
         self.tid = None
-        self.failed = []
+        self.failed = []    # RegisterHotKey refused (taken by another program)
+        self.hooked = []    # ...of those, handled by the keyboard hook instead
         self.ready = threading.Event()
+        self._proc = None   # keep the hook callback alive
+
+    def _install_hook(self, binds):
+        LRESULT = ctypes.c_ssize_t
+        HOOKPROC = ctypes.WINFUNCTYPE(LRESULT, ctypes.c_int, wintypes.WPARAM, wintypes.LPARAM)
+        user32.SetWindowsHookExW.restype = wintypes.HHOOK
+        user32.SetWindowsHookExW.argtypes = [ctypes.c_int, HOOKPROC, wintypes.HINSTANCE, wintypes.DWORD]
+        user32.CallNextHookEx.restype = LRESULT
+        user32.CallNextHookEx.argtypes = [wintypes.HHOOK, ctypes.c_int, wintypes.WPARAM, wintypes.LPARAM]
+        user32.GetAsyncKeyState.restype = ctypes.c_short
+        kernel32.GetModuleHandleW.restype = wintypes.HMODULE
+        table = {}
+        for mods, vk, cb in binds:
+            table.setdefault(vk, []).append((mods, cb))
+        down = set()
+
+        def held(v):
+            return user32.GetAsyncKeyState(v) & 0x8000
+
+        def cur_mods():
+            m = 0
+            if held(0x11):
+                m |= MOD_CONTROL
+            if held(0x12):
+                m |= MOD_ALT
+            if held(0x10):
+                m |= MOD_SHIFT
+            if held(0x5B) or held(0x5C):
+                m |= 0x8
+            return m
+
+        def proc(n, wp, lp):
+            try:
+                if n == 0:
+                    vk = ctypes.cast(lp, ctypes.POINTER(KBDLLHOOKSTRUCT)).contents.vkCode
+                    if wp in (0x100, 0x104):          # WM_KEYDOWN / WM_SYSKEYDOWN
+                        if vk in table and vk not in down:
+                            down.add(vk)
+                            m = cur_mods()
+                            for mods, cb in table[vk]:
+                                if m == mods:      # run outside the hook: hooks must return fast
+                                    threading.Thread(target=_call_safe, args=(cb,), daemon=True).start()
+                    elif wp in (0x101, 0x105):        # key up
+                        down.discard(vk)
+            except Exception:
+                pass
+            return user32.CallNextHookEx(None, n, wp, lp)
+
+        self._proc = HOOKPROC(proc)
+        return user32.SetWindowsHookExW(13, self._proc, kernel32.GetModuleHandleW(None), 0)  # WH_KEYBOARD_LL
 
     def run(self):
         if not IS_WIN:
             self.ready.set()
             return
         self.tid = kernel32.GetCurrentThreadId()
-        cbs = {}
+        cbs, fallback = {}, []
         for i, (mods, vk, cb) in enumerate(self.bindings, start=1):
             if user32.RegisterHotKey(None, i, mods | MOD_NOREPEAT, vk):
                 cbs[i] = cb
             else:
                 self.failed.append((mods, vk))
+                fallback.append((mods, vk, cb))
+        hook = None
+        if fallback:
+            try:
+                hook = self._install_hook(fallback)
+            except Exception as e:
+                print("keyboard hook failed:", e)
+            if hook:
+                self.hooked = [(m, v) for m, v, _ in fallback]
         self.ready.set()
         msg = wintypes.MSG()
         while user32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
             if msg.message == WM_HOTKEY and msg.wParam in cbs:
-                try:
-                    cbs[msg.wParam]()
-                except Exception as e:  # never kill the hotkey thread
-                    print("hotkey callback error:", e)
+                _call_safe(cbs[msg.wParam])
         for i in cbs:
             user32.UnregisterHotKey(None, i)
+        if hook:
+            user32.UnhookWindowsHookEx(hook)
 
     def stop(self):
         if IS_WIN and self.tid:
             user32.PostThreadMessageW(self.tid, WM_QUIT, 0, 0)
+
+
+# --------------------------------------------------------------------------- windows / IME
+def disable_ime():
+    """Turn the input method off for HeadField's own windows (this process only;
+    the game and other programs are not affected). Without this a Chinese IME
+    swallows single-letter keys like o / c / r in the HeadField window.
+    Must run before the first window is created."""
+    if not IS_WIN:
+        return False
+    try:
+        imm = ctypes.windll.imm32
+        imm.ImmDisableIME.argtypes = [wintypes.DWORD]
+        return bool(imm.ImmDisableIME(0xFFFFFFFF))   # -1 = all threads of this process
+    except Exception:
+        return False
+
+
+def _find_window(title):
+    user32.FindWindowW.restype = wintypes.HWND
+    user32.FindWindowW.argtypes = [wintypes.LPCWSTR, wintypes.LPCWSTR]
+    return user32.FindWindowW(None, title)
+
+
+def no_ime_window(title):
+    """Detach the input method from one window (backup for disable_ime)."""
+    if not IS_WIN:
+        return False
+    try:
+        hwnd = _find_window(title)
+        if not hwnd:
+            return False
+        imm = ctypes.windll.imm32
+        imm.ImmAssociateContextEx.argtypes = [wintypes.HWND, wintypes.HANDLE, wintypes.DWORD]
+        return bool(imm.ImmAssociateContextEx(hwnd, None, 0))
+    except Exception:
+        return False
+
+
+def set_topmost(title, on=True):
+    """Keep a window above others (does not take focus from the game).
+    Has no effect over an exclusive-fullscreen game."""
+    if not IS_WIN:
+        return False
+    hwnd = _find_window(title)
+    if not hwnd:
+        return False
+    user32.SetWindowPos.argtypes = [wintypes.HWND, wintypes.HWND, ctypes.c_int, ctypes.c_int,
+                                    ctypes.c_int, ctypes.c_int, wintypes.UINT]
+    after = ctypes.c_void_p(-1 if on else -2)   # HWND_TOPMOST / HWND_NOTOPMOST
+    return bool(user32.SetWindowPos(hwnd, after, 0, 0, 0, 0, 0x0001 | 0x0002 | 0x0010))  # NOSIZE|NOMOVE|NOACTIVATE
 
 
 def beep(freq=1000, ms=60):
