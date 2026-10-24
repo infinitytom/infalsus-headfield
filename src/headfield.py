@@ -326,6 +326,9 @@ class App:
         else:
             self.routine = FollowTest(y, True)
         self.routine.kind = kind
+        self.log_event(f"start {kind}")
+        if not self.headless:
+            self.keep_on_top(force=True)   # drop main window below the target window
         if not self.headless:
             cv2.namedWindow(WIN_TGT, cv2.WINDOW_NORMAL)
             cv2.setWindowProperty(WIN_TGT, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
@@ -534,7 +537,9 @@ class App:
         now = time.perf_counter()
         if force or now - self._top_t > 2.0:
             self._top_t = now
-            winio.set_topmost(WIN_MAIN, bool(self.cfg.get("always_on_top")))
+            # never above the full-screen calibration/test window
+            on = bool(self.cfg.get("always_on_top")) and self.routine is None and self.pending is None
+            winio.set_topmost(WIN_MAIN, on)
 
     def read_controls(self):
         for key, _, label in SLIDERS:
