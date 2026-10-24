@@ -1,0 +1,4 @@
+# mediapipe pulls in opencv-contrib-python; do not also install opencv-python
+mediapipe>=0.10.30
+pygrabber   # list camera names without opening them
+numpy

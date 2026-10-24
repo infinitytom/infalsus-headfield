@@ -1,0 +1,10 @@
+# local environment & data (never commit)
+.venv/
+__pycache__/
+*.pyc
+config.json
+profiles/
+logs/
+models/*.task
+env_report.txt
+_dev_local/
